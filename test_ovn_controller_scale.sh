@@ -44,7 +44,7 @@ for i in $(seq 1 $n_ls); do
         -- lsp-add $ls lsp_${ls}_jr \
         -- lsp-set-type lsp_${ls}_jr router \
         -- lsp-set-options lsp_${ls}_jr router-port=lrp_jr_${ls} \
-        -- lsp-set-addresses lsp_${ls}_jr
+        -- lsp-set-addresses lsp_${ls}_jr router
 
     for j in $(seq 1 $n_lsp_per_ls); do
         lsp_id=$(printf "%02d" $j)  # e.g. 08
