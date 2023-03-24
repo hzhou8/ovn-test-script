@@ -1,0 +1,9 @@
+export N_CHASSIS=200
+export N_ZONE=1
+export N_LSP_PER_LS=50
+export N_LSP_IN_PG_BIG=10000
+export N_LSP_IN_PG_SMALL=10
+export N_VIP=0
+export N_BE_PER_VIP=0
+export N_ACL=5
+export N_L4_PER_ACL=5
