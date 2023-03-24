@@ -89,6 +89,8 @@ get_lsp_name () {
     echo lsp_${zone}_${ls_id}_${lsp_id} # e.g. lsp_1_0003_08
 }
 
+date
+echo start
 for zone in $(seq 1 $n_zone); do
     lr=lr_$zone                                         # e.g. lr_1
     ovn-nbctl lr-add $lr
@@ -106,25 +108,26 @@ for zone in $(seq 1 $n_zone); do
         lrp=lrp_${lr}_${ls}
 
         # Connect the LS to LR
-        ovn-nbctl ls-add $ls \
+        cmd="ls-add $ls \
             -- lrp-add $lr $lrp \
                ff:f${zone}:aa:${ls_high}:${ls_low}:01 $ls_ip_pre.1/24 \
             -- lsp-add $ls $lsp_lr \
             -- lsp-set-type $lsp_lr router \
             -- lsp-set-options $lsp_lr router-port=$lrp \
             -- lrp-set-gateway-chassis $lrp chassis_$ls_id 1 \
-            -- lsp-set-addresses $lsp_lr router
+            -- lsp-set-addresses $lsp_lr router"
 
         # Create VIF LSPs
         for j in $(seq 1 $n_lsp_per_ls); do
             lsp_id=$(printf "%02d" $j)          # e.g. 08
             lsp=lsp_${zone}_${ls_id}_${lsp_id}  # e.g. lsp_1_0003_08
-            ovn-nbctl lsp-add $ls $lsp \
+            cmd="${cmd} -- lsp-add $ls $lsp \
                 -- lsp-set-addresses $lsp \
-                   "ff:f${zone}:bb:${ls_high}:${ls_low}:${lsp_id} $ls_ip_pre.1$lsp_id" \
+                   'ff:f${zone}:bb:${ls_high}:${ls_low}:${lsp_id} $ls_ip_pre.1$lsp_id' \
                 -- lsp-set-port-security $lsp \
-                   "ff:f${zone}:bb:${ls_high}:${ls_low}:${lsp_id} $ls_ip_pre.1$lsp_id"
+                   'ff:f${zone}:bb:${ls_high}:${ls_low}:${lsp_id} $ls_ip_pre.1$lsp_id'"
         done
+        eval ovn-nbctl $cmd
     done
 
     if (($n_acl == 0)); then
@@ -186,12 +189,15 @@ for zone in $(seq 1 $n_zone); do
             "inport == @pg_small_$zone && ip4 && ip4.dst == \$pg_big_${zone}_ip4 && $l4_match" allow-related
     done
 
+    date
+    echo "zone$zone logical routers, switches, ports and ACLs are created."
 done
+
 
 # For the zone_1, create cluster-wide east-west LBs
 lb_port=8888
 for v in $(seq 1 $n_vip); do
-    vip=123.123.123.$v
+    vip=123.123.$(( $v / 100 )).$(( $v % 100 ))
     be_ip_ports=$(get_lsp_ip 1 $v 1):$lb_port
     for i in $(seq 2 $n_be_per_vip); do
         lsp_ip=$(get_lsp_ip 1 $v $i)
@@ -199,6 +205,25 @@ for v in $(seq 1 $n_vip); do
     done
 
     ovn-nbctl lb-add lb_$v $vip:$lb_port $be_ip_ports tcp
+done
+
+# Create LB templates for north-south LBs
+lb_template_var="^nodeport_vip"
+for v in $(seq 1 $n_vip); do
+    be_ip_ports=$(get_lsp_ip 1 $v 1):$lb_port
+    for i in $(seq 2 $n_be_per_vip); do
+        lsp_ip=$(get_lsp_ip 1 $v $i)
+        be_ip_ports="$be_ip_ports,$lsp_ip:$lb_port"
+    done
+
+    ovn-nbctl --template lb-add lb_$v ${lb_template_var}:${v} $be_ip_ports tcp
+done
+
+
+# Create LB group
+lb_group=$(ovn-nbctl create load_balancer_group name=cluster_lbs)
+for i in $(ovn-nbctl --format=table --no-headings --column=_uuid list load_balancer); do
+    ovn-nbctl add load_balancer_group cluster_lbs load_balancer $i
 done
 
 # For the zone_1, create the join switch and connect to lr_1
@@ -221,14 +246,18 @@ for i in $(seq 1 $n_chassis); do
     ch_low_ip=$((10#$ch_low))                # e.g. 3
     ch=chassis_$ch_id                        # e.g. chassis_0003
     ch_ip=192.168.${ch_high_ip}.${ch_low_ip} # e.g. 192.168.0.3
+
     ovn-sbctl chassis-add $ch geneve $ch_ip
+    cmd=""
     for zone in $(seq 1 $n_zone); do
         for j in $(seq 1 $n_lsp_per_ls); do
             lsp_id=$(printf "%02d" $j)         # e.g. 08
             lsp=lsp_${zone}_${ch_id}_${lsp_id} # e.g. lsp_1_0003_08
-            ovn-sbctl lsp-bind $lsp $ch
+            ch_uuid=$(ovn-sbctl --column=_uuid --bare list chassis $ch)
+            cmd="${cmd} -- set port_binding $lsp chassis=$ch_uuid up=true"
         done
     done
+    eval ovn-sbctl $cmd
 
     # Create GR and connect to ls_join
     gr=gr_${ch_id}
@@ -236,6 +265,7 @@ for i in $(seq 1 $n_chassis); do
     lsp=lsp_ls_join_${gr}
     ovn-nbctl lr-add $gr \
         -- set logical_router $gr options:chassis=$ch \
+                                  options:dynamic_neigh_routers=true \
         -- lrp-add $gr $lrp ff:ff:aa:${ch_high}:${ch_low}:01 \
            100.64.${ch_high_ip}.${ch_low_ip}/16 \
         -- lsp-add ls_join $lsp \
@@ -264,26 +294,44 @@ for i in $(seq 1 $n_chassis); do
 
     # Add cluster LBs to the GR and the node LS (zone1 only)
     ls_zone1=ls_1_${ch_id}
-    for v in $(seq 1 $n_vip); do
-        ovn-nbctl lr-lb-add $gr lb_$v -- ls-lb-add $ls_zone1 lb_$v
-    done
-
-    # Create north-south (node-port) LBs, and add to node GR and LS
-    if (($i <= $n_nodeport_node)); then
-        for v in $(seq 1 $n_nodeport_vip); do
-            be_ip_ports=$(get_lsp_ip 1 $v 1):$lb_port
-            for be_lsp in $(seq 2 $n_be_per_vip); do
-                be_lsp_ip=$(get_lsp_ip 1 $v $be_lsp)
-                be_ip_ports="$be_ip_ports,$be_lsp_ip:$lb_port"
-            done
-            vip_port=$ch_ip:9$v
-            lb_name=lb_${v}_nodeport_$i
-            ovn-nbctl lb-add $lb_name $vip_port $be_ip_ports tcp
-            ovn-nbctl lr-lb-add $gr $lb_name -- ls-lb-add $ls $lb_name
+    if [ "$lb_group" != "" ]; then
+        ovn-nbctl set logical_router $gr load_balancer_group="$lb_group" \
+            -- set logical_switch $ls_zone1 load_balancer_group="$lb_group"
+    else
+        for v in $(seq 1 $n_vip); do
+            ovn-nbctl lr-lb-add $gr lb_$v -- ls-lb-add $ls_zone1 lb_$v
         done
     fi
 
+    # Create north-south (node-port) LBs, and add to node GR and LS
+    if (($i <= $n_nodeport_node)); then
+        if [ "$lb_template_var" != "" ]; then
+            # Template LB is already in lb group. Just create template vars here.
+            ovn-nbctl create chassis_template_var \
+                chassis=$ch variables:${lb_template_var}=$ch_ip
+        else
+            for v in $(seq 1 $n_nodeport_vip); do
+                be_ip_ports=$(get_lsp_ip 1 $v 1):$lb_port
+                for be_lsp in $(seq 2 $n_be_per_vip); do
+                    be_lsp_ip=$(get_lsp_ip 1 $v $be_lsp)
+                    be_ip_ports="$be_ip_ports,$be_lsp_ip:$lb_port"
+                done
+                vip_port=$ch_ip:$v
+                lb_name=lb_${v}_nodeport_$i
+                ovn-nbctl lb-add $lb_name $vip_port $be_ip_ports tcp \
+                    -- lr-lb-add $gr $lb_name -- ls-lb-add $ls $lb_name
+            done
+        fi
+    fi
+
     # TODO: create static routes
+
+    if [ "$ch_low" == "00" ]; then
+        date
+        echo "Created $i chassis related objects."
+    fi
 done
 # TODO:
 # create snat/dnat rules
+date
+echo done
